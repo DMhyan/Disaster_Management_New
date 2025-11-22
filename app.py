@@ -19,18 +19,37 @@ load_dotenv()
 from db import Person, add_person, delete_person, list_persons, log_detection
 from ml.mediapipe_detector import FaceDetector
 from ml.facenet_embedder import FaceEmbedder
+from ml.pose_detector import PoseDetector
+from werkzeug.utils import secure_filename
+import google.generativeai as genai
+import json
+from PIL import Image as PILImage
 
 
 # Matching threshold (cosine similarity)
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", 0.6))
 
+# Disaster prediction classes
+DISASTER_CLASSES = ['earthquake', 'flood', 'wildfire', 'hurricane', 'landslide', 'drought', 'tornado', 'tsunami', 'volcanic_eruption']
+
 
 def create_app() -> Flask:
     app = Flask(__name__)
+    
+    # Configure upload folder for disaster prediction
+    app.config['UPLOAD_FOLDER'] = 'uploads'
+    app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    
+    # Configure Gemini API for disaster prediction
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    if gemini_api_key:
+        genai.configure(api_key=gemini_api_key)
 
     # Lazy-init heavy ML components
     detector = FaceDetector(min_confidence=0.5, model_selection=1)
     embedder = FaceEmbedder()
+    pose_detector = PoseDetector(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
     detection_refresh: Dict[str, datetime] = {}
     persons_cache: List[Person] = []
@@ -179,6 +198,10 @@ def create_app() -> Flask:
     def index():
         return render_template("index.html")
 
+    @app.route("/health")
+    def health():
+        return jsonify({"status": "ok", "models_loaded": True}), 200
+
     @app.route("/register", methods=["GET", "POST"])
     def register():
         if request.method == "GET":
@@ -280,51 +303,69 @@ def create_app() -> Flask:
 
     @app.route("/api/recognize", methods=["POST"])
     def api_recognize():
-        img = _decode_image_from_request("image")
-        if img is None:
-            return jsonify({"ok": False, "error": "No image received."}), 400
+        try:
+            app.logger.info("Recognize request received")
+            
+            img = _decode_image_from_request("image")
+            if img is None:
+                app.logger.warning("No image decoded from request")
+                return jsonify({"ok": False, "error": "No image received."}), 400
 
-        location_label, latitude, longitude = _extract_location_payload()
+            app.logger.info(f"Image decoded: shape={img.shape}")
+            location_label, latitude, longitude = _extract_location_payload()
 
-        face = detector.crop_face(img, margin=0.25)
-        if face is None:
-            return jsonify({"ok": False, "match": False, "message": "No face detected."}), 200
+            app.logger.info("Detecting face...")
+            face = detector.crop_face(img, margin=0.25)
+            if face is None:
+                app.logger.info("No face detected in image")
+                return jsonify({"ok": False, "match": False, "message": "No face detected."}), 200
 
-        emb = embedder.embed(face)
-        if emb is None:
-            return jsonify({"ok": False, "match": False, "message": "Failed to embed face."}), 500
+            app.logger.info(f"Face detected: shape={face.shape}")
+            app.logger.info("Embedding face...")
+            emb = embedder.embed(face)
+            if emb is None:
+                app.logger.error("Failed to generate embedding")
+                return jsonify({"ok": False, "match": False, "message": "Failed to embed face."}), 500
 
-        _refresh_people()
-        if not persons_cache:
-            return jsonify({"ok": True, "match": False, "message": "Database is empty."}), 200
+            app.logger.info(f"Embedding generated: shape={emb.shape}")
+            _refresh_people()
+            if not persons_cache:
+                app.logger.info("Database is empty")
+                return jsonify({"ok": True, "match": False, "message": "Database is empty."}), 200
 
-        best_person, best_score = _best_match(emb)
+            app.logger.info(f"Matching against {len(persons_cache)} persons")
+            best_person, best_score = _best_match(emb)
 
-        if best_person and best_score >= SIMILARITY_THRESHOLD:
-            _log_detection(best_person, location_label, latitude, longitude)
+            if best_person and best_score >= SIMILARITY_THRESHOLD:
+                app.logger.info(f"Match found: {best_person.name} with score {best_score}")
+                _log_detection(best_person, location_label, latitude, longitude)
+                return jsonify(
+                    {
+                        "ok": True,
+                        "match": True,
+                        "score": round(best_score, 4),
+                        "person": {
+                            "id": best_person.id,
+                            "name": best_person.name,
+                            "location": best_person.location,
+                            "gender": best_person.gender,
+                            "image_url": best_person.image_url,
+                        },
+                    }
+                ), 200
+
+            app.logger.info(f"No match found. Best score: {best_score}")
             return jsonify(
                 {
                     "ok": True,
-                    "match": True,
-                    "score": round(best_score, 4),
-                    "person": {
-                        "id": best_person.id,
-                        "name": best_person.name,
-                        "location": best_person.location,
-                        "gender": best_person.gender,
-                        "image_url": best_person.image_url,
-                    },
+                    "match": False,
+                    "score": round(best_score or -1.0, 4),
+                    "message": "No match found.",
                 }
             ), 200
-
-        return jsonify(
-            {
-                "ok": True,
-                "match": False,
-                "score": round(best_score or -1.0, 4),
-                "message": "No match found.",
-            }
-        ), 200
+        except Exception as e:
+            app.logger.exception("Error in api_recognize")
+            return jsonify({"ok": False, "error": f"Server error: {str(e)}"}), 500
 
     # --- Live video recognition ---
     def _get_live_location(token: Optional[str]) -> Tuple[Optional[str], Optional[float], Optional[float]]:
@@ -346,43 +387,122 @@ def create_app() -> Flask:
         longitude: Optional[float],
     ) -> np.ndarray:
         _refresh_people()
-        detections = detector.detect(frame_bgr)
-        for det in detections:
-            x, y, w, h = det["bbox"]
-            mx, my = int(w * 0.15), int(h * 0.15)
-            x0 = max(0, x - mx)
-            y0 = max(0, y - my)
-            x1 = min(frame_bgr.shape[1], x + w + mx)
-            y1 = min(frame_bgr.shape[0], y + h + my)
-            face = frame_bgr[y0:y1, x0:x1]
-            label = "Person"
-            color = (0, 190, 255)
-            if face.size > 0:
-                emb = embedder.embed(face)
-                if emb is not None:
-                    best_person, score = _best_match(emb)
-                    if best_person is not None and score >= SIMILARITY_THRESHOLD:
-                        label = f"{best_person.name} ({score:.2f})"
-                        color = (80, 200, 120)
-                        _log_detection(best_person, location_label, latitude, longitude)
-                    else:
-                        label = f"Unknown ({score:.2f})"
-                        color = (0, 190, 255)
-            cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), color, 2)
-            cv2.rectangle(frame_bgr, (x, y - 24), (x + max(120, w), y), color, -1)
-            cv2.putText(
-                frame_bgr,
-                label,
-                (x + 4, y - 6),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 0, 0),
-                1,
-                cv2.LINE_AA,
-            )
-        hint = f"Threshold: {SIMILARITY_THRESHOLD:.2f} | q to stop"
+        
+        # First, try pose detection for full body
+        pose_result = pose_detector.detect(frame_bgr)
+        
+        if pose_result is not None:
+            # Full body detected - use pose estimation
+            pose_state = pose_result['pose_state']
+            face_visible = pose_result['face_visible']
+            
+            # Draw pose landmarks
+            frame_bgr = pose_detector.draw_pose(frame_bgr, pose_result)
+            
+            # Determine color based on pose state
+            if pose_state == "fallen":
+                color = (0, 0, 255)  # Red for fallen
+                status_text = "⚠️ FALLEN"
+            elif pose_state == "sitting":
+                color = (0, 165, 255)  # Orange for sitting
+                status_text = "Sitting"
+            else:  # standing
+                color = (0, 255, 0)  # Green for standing
+                status_text = "Standing"
+            
+            # If face is visible, try face recognition
+            label = status_text
+            if face_visible and pose_result['bbox'] is not None:
+                x, y, w, h = pose_result['bbox']
+                # Try to detect and recognize face
+                face_detections = detector.detect(frame_bgr)
+                if face_detections:
+                    # Use the first detected face
+                    face_det = face_detections[0]
+                    fx, fy, fw, fh = face_det["bbox"]
+                    mx, my = int(fw * 0.15), int(fh * 0.15)
+                    fx0 = max(0, fx - mx)
+                    fy0 = max(0, fy - my)
+                    fx1 = min(frame_bgr.shape[1], fx + fw + mx)
+                    fy1 = min(frame_bgr.shape[0], fy + fh + my)
+                    face = frame_bgr[fy0:fy1, fx0:fx1]
+                    
+                    if face.size > 0:
+                        emb = embedder.embed(face)
+                        if emb is not None:
+                            best_person, score = _best_match(emb)
+                            if best_person is not None and score >= SIMILARITY_THRESHOLD:
+                                label = f"{best_person.name} - {status_text} ({score:.2f})"
+                                if pose_state == "fallen":
+                                    color = (0, 0, 255)  # Keep red for fallen
+                                else:
+                                    color = (80, 200, 120)  # Green for recognized
+                                _log_detection(best_person, location_label, latitude, longitude)
+                            else:
+                                label = f"Unknown - {status_text} ({score:.2f})"
+            
+            # Draw bounding box and label
+            if pose_result['bbox'] is not None:
+                x, y, w, h = pose_result['bbox']
+                cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), color, 2)
+                
+                # Draw label background
+                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                cv2.rectangle(frame_bgr, (x, y - 30), (x + label_size[0] + 10, y), color, -1)
+                cv2.putText(
+                    frame_bgr,
+                    label,
+                    (x + 5, y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+        else:
+            # No full body detected - fall back to face detection only
+            face_detections = detector.detect(frame_bgr)
+            for det in face_detections:
+                x, y, w, h = det["bbox"]
+                mx, my = int(w * 0.15), int(h * 0.15)
+                x0 = max(0, x - mx)
+                y0 = max(0, y - my)
+                x1 = min(frame_bgr.shape[1], x + w + mx)
+                y1 = min(frame_bgr.shape[0], y + h + my)
+                face = frame_bgr[y0:y1, x0:x1]
+                label = "Person (Face Only)"
+                color = (0, 190, 255)
+                
+                if face.size > 0:
+                    emb = embedder.embed(face)
+                    if emb is not None:
+                        best_person, score = _best_match(emb)
+                        if best_person is not None and score >= SIMILARITY_THRESHOLD:
+                            label = f"{best_person.name} ({score:.2f})"
+                            color = (80, 200, 120)
+                            _log_detection(best_person, location_label, latitude, longitude)
+                        else:
+                            label = f"Unknown ({score:.2f})"
+                            color = (0, 190, 255)
+                
+                cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), color, 2)
+                cv2.rectangle(frame_bgr, (x, y - 24), (x + max(150, w), y), color, -1)
+                cv2.putText(
+                    frame_bgr,
+                    label,
+                    (x + 4, y - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+        
+        # Draw info text
+        hint = f"Threshold: {SIMILARITY_THRESHOLD:.2f} | Pose + Face Detection"
         cv2.putText(frame_bgr, hint, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 30), 3, cv2.LINE_AA)
         cv2.putText(frame_bgr, hint, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        
         return frame_bgr
 
     def _gen_mjpeg(token: Optional[str]):
@@ -420,17 +540,123 @@ def create_app() -> Flask:
 
     @app.route("/live")
     def live_page():
+        # Check if running on a server without camera access
+        is_production = os.environ.get("RENDER") or os.environ.get("RAILWAY_ENVIRONMENT")
+        if is_production:
+            return render_template(
+                "index.html",
+                error="Live video feed is not available in production (requires server camera access). Use the Recognize page instead."
+            )
         token = secrets.token_urlsafe(16)
         return render_template("live.html", threshold=SIMILARITY_THRESHOLD, live_token=token)
 
     @app.route("/video_feed")
     def video_feed():
+        # Check if running on a server without camera access
+        is_production = os.environ.get("RENDER") or os.environ.get("RAILWAY_ENVIRONMENT")
+        if is_production:
+            return jsonify({"error": "Video feed not available in production"}), 503
         token = request.args.get("token") or ""
         return app.response_class(_gen_mjpeg(token), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    # --- Disaster Prediction Routes ---
+    def _classify_disaster(image_path: str) -> dict:
+        """Classify disaster type using Gemini Vision API."""
+        gemini_api_key = os.environ.get("GEMINI_API_KEY")
+        if not gemini_api_key:
+            raise ValueError("GEMINI_API_KEY not configured in environment variables")
+        
+        # Open image and ensure it's closed after use
+        img = PILImage.open(image_path)
+        try:
+            # Use gemini-2.5-flash for better free tier quota
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            
+            prompt = """Analyze this image and determine if it shows a natural disaster. 
+            
+Classify it into ONE of these categories:
+- earthquake (collapsed buildings, cracked roads, structural damage)
+- flood (water covering streets, submerged areas, water damage)
+- wildfire (flames, smoke, burned areas, fire damage)
+- hurricane (extreme wind damage, storm destruction)
+- landslide (mudslides, collapsed hillsides, debris flow)
+- drought (dried land, cracked earth, water scarcity)
+- tornado (funnel clouds, tornado damage, twisted debris)
+- tsunami (massive waves, coastal flooding, wave damage)
+- volcanic_eruption (lava, volcanic ash, eruption)
+- none (if no disaster is visible)
+
+Respond ONLY with a JSON object in this exact format:
+{
+    "disaster_type": "category_name",
+    "confidence": 0.95,
+    "description": "brief description of what you see",
+    "severity": "low/medium/high"
+}"""
+            
+            response = model.generate_content([prompt, img])
+            
+            try:
+                text = response.text.strip()
+                if text.startswith('```'):
+                    text = text.split('```')[1]
+                    if text.startswith('json'):
+                        text = text[4:]
+                text = text.strip()
+                result = json.loads(text)
+                return result
+            except json.JSONDecodeError:
+                return {
+                    "disaster_type": "unknown",
+                    "confidence": 0.0,
+                    "description": response.text,
+                    "severity": "unknown"
+                }
+        finally:
+            # Explicitly close the image to release the file handle
+            img.close()
+
+    @app.route("/disaster-prediction")
+    def disaster_prediction_page():
+        return render_template("disaster_prediction.html")
+
+    @app.route("/api/predict-disaster", methods=["POST"])
+    def predict_disaster():
+        filepath = None
+        try:
+            if 'file' not in request.files:
+                return jsonify({"error": "No file uploaded"}), 400
+            
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({"error": "No file selected"}), 400
+            
+            filename = secure_filename(file.filename)
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(filepath)
+            
+            try:
+                result = _classify_disaster(filepath)
+                return jsonify(result)
+            except Exception as e:
+                app.logger.exception("Error in disaster prediction")
+                return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
+                
+        except Exception as e:
+            app.logger.exception("Error in predict_disaster")
+            return jsonify({"error": str(e)}), 500
+        finally:
+            # Clean up the uploaded file in finally block to ensure it's always deleted
+            if filepath and os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except Exception as cleanup_error:
+                    app.logger.warning(f"Failed to delete file {filepath}: {cleanup_error}")
 
     return app
 
 
+app = create_app()
+
 if __name__ == "__main__":
-    app = create_app()
     app.run(debug=True)
